@@ -3,7 +3,7 @@ import React, {useCallback, useEffect, useMemo, useState} from 'react';
 import {render, Box, Text, useApp, useInput, useStdin} from 'ink';
 import {basename, join} from 'node:path';
 import {copyFile, mkdir, readdir, readFile, rm, stat} from 'node:fs/promises';
-import {constants} from 'node:fs';
+import {closeSync, constants, openSync} from 'node:fs';
 import {spawn} from 'node:child_process';
 
 const DEFAULT_SERVICE_DIR = '/etc/systemd/system';
@@ -75,6 +75,66 @@ function sanitizeServiceName(input) {
   return fileName.endsWith('.service') ? fileName : `${fileName}.service`;
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function clearTerminal() {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write('\x1b[0m\x1b[?25h\x1b[2J\x1b[H');
+}
+
+function openTtyStdio() {
+  const fds = [];
+
+  try {
+    fds.push(openSync('/dev/tty', 'r'));
+    fds.push(openSync('/dev/tty', 'w'));
+    fds.push(openSync('/dev/tty', 'w'));
+
+    return {
+      stdio: fds,
+      close() {
+        for (const fd of fds) closeSync(fd);
+      }
+    };
+  } catch {
+    for (const fd of fds) closeSync(fd);
+
+    return {
+      stdio: 'inherit',
+      close() {}
+    };
+  }
+}
+
+function runEditor(filePath) {
+  const tty = openTtyStdio();
+  let settled = false;
+
+  const finish = result => {
+    if (settled) return;
+    settled = true;
+    tty.close();
+    return result;
+  };
+
+  return new Promise(resolve => {
+    const child = spawn(`${EDITOR} ${shellQuote(filePath)}`, {
+      shell: true,
+      stdio: tty.stdio
+    });
+
+    child.on('exit', code => {
+      resolve(finish({code}));
+    });
+
+    child.on('error', error => {
+      resolve(finish({error}));
+    });
+  });
+}
+
 function ViewPane({content, offset, selected}) {
   const lines = content.split('\n');
   const visible = lines.slice(offset, offset + VISIBLE_ROWS);
@@ -109,7 +169,7 @@ function Prompt({label, value, help}) {
 }
 
 function App() {
-  const {exit} = useApp();
+  const {exit, waitUntilRenderFlush} = useApp();
   const {setRawMode, isRawModeSupported} = useStdin();
   const [services, setServices] = useState([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -172,24 +232,25 @@ function App() {
 
     setMode('editing');
     setStatus(`Opening ${selected.name} in ${EDITOR}...`);
-
     setRawMode(false);
+    process.stdin.pause();
 
-    await new Promise(resolve => {
-      const child = spawn(EDITOR, [selected.path], {stdio: 'inherit'});
-      child.on('exit', code => {
-        setStatus(code === 0 ? `Saved ${selected.name}.` : `${EDITOR} exited with code ${code}.`);
-        resolve();
-      });
-      child.on('error', spawnError => {
-        setStatus(formatError(spawnError));
-        resolve();
-      });
-    });
+    await waitUntilRenderFlush();
+    clearTerminal();
 
+    const result = await runEditor(selected.path);
+
+    clearTerminal();
     if (isRawModeSupported) setRawMode(true);
+    process.stdin.resume();
     setMode('list');
-    await reload(`Returned from ${EDITOR}.`);
+
+    if (result.error) {
+      setStatus(formatError(result.error));
+      return;
+    }
+
+    await reload(result.code === 0 ? `Returned from ${EDITOR}.` : `${EDITOR} exited with code ${result.code}.`);
   }
 
   async function copySelected() {
