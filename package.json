@@ -1,0 +1,16 @@
+{
+  "name": "service-manager",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "service-manager": "./src/index.jsx"
+  },
+  "scripts": {
+    "start": "bun run src/index.jsx",
+    "check": "bun run src/index.jsx --help > /dev/null"
+  },
+  "dependencies": {
+    "ink": "^7.0.5",
+    "react": "^19.2.7"
+  }
+}
