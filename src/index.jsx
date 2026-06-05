@@ -80,8 +80,23 @@ function clearTerminal() {
   process.stdout.write('\x1b[0m\x1b[?25h\x1b[2J\x1b[H');
 }
 
+function releaseStdinForEditor() {
+  if (!process.stdin.isTTY) return;
+
+  if (process.stdin.isRaw) {
+    process.stdin.setRawMode(false);
+  }
+
+  process.stdin.pause();
+  process.stdin.removeAllListeners('data');
+  process.stdin.removeAllListeners('readable');
+  process.stdin.removeAllListeners('keypress');
+}
+
 function runEditor(filePath) {
   return new Promise(resolve => {
+    releaseStdinForEditor();
+
     const child = spawn('/bin/sh', ['-c', `exec ${EDITOR} "$1"`, 'service-manager-editor', filePath], {
       stdio: 'inherit'
     });
@@ -356,7 +371,9 @@ async function main() {
   let initialStatus;
 
   while (true) {
-    const instance = render(<App initialSelectedPath={initialSelectedPath} initialStatus={initialStatus} />);
+    const instance = render(<App initialSelectedPath={initialSelectedPath} initialStatus={initialStatus} />, {
+      kittyKeyboard: {mode: 'disabled'}
+    });
     const result = await instance.waitUntilExit();
     instance.cleanup();
 
