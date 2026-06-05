@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {render, Box, Text, useApp, useInput, useStdin} from 'ink';
 import {basename, join} from 'node:path';
 import {copyFile, mkdir, readdir, readFile, rm, stat} from 'node:fs/promises';
-import {closeSync, constants, openSync} from 'node:fs';
+import {constants} from 'node:fs';
 import {spawn} from 'node:child_process';
 
 const DEFAULT_SERVICE_DIR = '/etc/systemd/system';
@@ -75,62 +75,23 @@ function sanitizeServiceName(input) {
   return fileName.endsWith('.service') ? fileName : `${fileName}.service`;
 }
 
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
-}
-
 function clearTerminal() {
   if (!process.stdout.isTTY) return;
   process.stdout.write('\x1b[0m\x1b[?25h\x1b[2J\x1b[H');
 }
 
-function openTtyStdio() {
-  const fds = [];
-
-  try {
-    fds.push(openSync('/dev/tty', 'r'));
-    fds.push(openSync('/dev/tty', 'w'));
-    fds.push(openSync('/dev/tty', 'w'));
-
-    return {
-      stdio: fds,
-      close() {
-        for (const fd of fds) closeSync(fd);
-      }
-    };
-  } catch {
-    for (const fd of fds) closeSync(fd);
-
-    return {
-      stdio: 'inherit',
-      close() {}
-    };
-  }
-}
-
 function runEditor(filePath) {
-  const tty = openTtyStdio();
-  let settled = false;
-
-  const finish = result => {
-    if (settled) return;
-    settled = true;
-    tty.close();
-    return result;
-  };
-
   return new Promise(resolve => {
-    const child = spawn(`${EDITOR} ${shellQuote(filePath)}`, {
-      shell: true,
-      stdio: tty.stdio
+    const child = spawn('/bin/sh', ['-c', `exec ${EDITOR} "$1"`, 'service-manager-editor', filePath], {
+      stdio: 'inherit'
     });
 
     child.on('exit', code => {
-      resolve(finish({code}));
+      resolve({code});
     });
 
     child.on('error', error => {
-      resolve(finish({error}));
+      resolve({error});
     });
   });
 }
@@ -168,14 +129,15 @@ function Prompt({label, value, help}) {
   );
 }
 
-function App() {
-  const {exit, waitUntilRenderFlush} = useApp();
-  const {setRawMode, isRawModeSupported} = useStdin();
+function App({initialSelectedPath, initialStatus = ''}) {
+  const {exit} = useApp();
+  const {isRawModeSupported} = useStdin();
+  const loadedOnce = useRef(false);
   const [services, setServices] = useState([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [status, setStatus] = useState('');
+  const [status, setStatus] = useState(initialStatus);
   const [mode, setMode] = useState('list');
   const [viewContent, setViewContent] = useState('');
   const [viewOffset, setViewOffset] = useState(0);
@@ -190,8 +152,18 @@ function App() {
     try {
       const nextServices = await loadServices();
       setServices(nextServices);
-      setSelectedIndex(index => clamp(index, 0, Math.max(0, nextServices.length - 1)));
-      setStatus(message || `Loaded ${nextServices.length} service file${nextServices.length === 1 ? '' : 's'}.`);
+      setSelectedIndex(index => {
+        const matchingIndex = initialSelectedPath
+          ? nextServices.findIndex(service => service.path === initialSelectedPath)
+          : -1;
+        return matchingIndex === -1
+          ? clamp(index, 0, Math.max(0, nextServices.length - 1))
+          : matchingIndex;
+      });
+      setStatus(message ?? (!loadedOnce.current && initialStatus
+        ? initialStatus
+        : `Loaded ${nextServices.length} service file${nextServices.length === 1 ? '' : 's'}.`));
+      loadedOnce.current = true;
     } catch (loadError) {
       setServices([]);
       setSelectedIndex(0);
@@ -199,7 +171,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [initialSelectedPath, initialStatus]);
 
   useEffect(() => {
     reload();
@@ -227,30 +199,14 @@ function App() {
     }
   }
 
-  async function editSelected() {
+  function editSelected() {
     if (!selected) return;
 
-    setMode('editing');
     setStatus(`Opening ${selected.name} in ${EDITOR}...`);
-    setRawMode(false);
-    process.stdin.pause();
-
-    await waitUntilRenderFlush();
-    clearTerminal();
-
-    const result = await runEditor(selected.path);
-
-    clearTerminal();
-    if (isRawModeSupported) setRawMode(true);
-    process.stdin.resume();
-    setMode('list');
-
-    if (result.error) {
-      setStatus(formatError(result.error));
-      return;
-    }
-
-    await reload(result.code === 0 ? `Returned from ${EDITOR}.` : `${EDITOR} exited with code ${result.code}.`);
+    exit({
+      action: 'edit',
+      filePath: selected.path
+    });
   }
 
   async function copySelected() {
@@ -386,8 +342,6 @@ function App() {
         </Box>
       )}
 
-      {mode === 'editing' && <Text color="yellow">Editor is active. Save and quit {EDITOR} to return.</Text>}
-
       {status && <Text color={status.includes('denied') || status.includes('exists') || status.includes('exited') ? 'red' : 'green'}>{status}</Text>}
 
       <Text color="gray">
@@ -397,4 +351,28 @@ function App() {
   );
 }
 
-render(<App />);
+async function main() {
+  let initialSelectedPath;
+  let initialStatus;
+
+  while (true) {
+    const instance = render(<App initialSelectedPath={initialSelectedPath} initialStatus={initialStatus} />);
+    const result = await instance.waitUntilExit();
+    instance.cleanup();
+
+    if (!result || result.action !== 'edit') return;
+
+    initialSelectedPath = result.filePath;
+    clearTerminal();
+    const editorResult = await runEditor(result.filePath);
+    clearTerminal();
+
+    initialStatus = editorResult.error
+      ? formatError(editorResult.error)
+      : editorResult.code === 0
+        ? `Returned from ${EDITOR}.`
+        : `${EDITOR} exited with code ${editorResult.code}.`;
+  }
+}
+
+await main();
